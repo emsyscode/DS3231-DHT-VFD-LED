@@ -1,0 +1,602 @@
+/*Last update 28/05/20
+   Displaying Humidity, Temperature, Heat Index from DHT on the VFD
+   Displaying Time: hours/minutes/seconds +  dayOfWeek  || dayOfMonth/month/year + dayOfWeek
+   Change mode with button
+   configure RTC with buttons - Press Set button while on displayMode: sec/minutes/hours or displayMode: day/month/year
+                              - Press Set button again to go through the different variables
+                              - Press btnUp or btnDown to change values
+                              - Press btnMode to get out of configuration Mode
+
+   DisplayModes
+   0: Humidity
+   1: temperature (Cº)
+   2: temperature (F)
+   3: heatIndex (Cº)
+   4: heatIndex (F)
+   5: hours/minutes/seconds + dayOfWeek
+   6 dayOfMonth/month/year + dayOfWeek
+*/
+
+#include "Wire.h"
+#include "DHT.h"
+#include <avr/interrupt.h>
+#include <math.h>;
+
+#define RTC_I2C_ADDRESS 0x68  // This is address of I2C to module of RTC.
+#define DHTPIN 2     // Digital pin connected to the DHT sensor
+#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+
+//ISR(TIMER1_COMPA_vect );
+#define btnMode 3     // adjust of seconds
+#define btnUp 4       // adjust of minutes
+#define btnDown 5     // adjust of hours
+#define btnSet 6      // to Set the clock module
+//
+#define VFD_in 7  // This is the pin number 7 on Arduino UNO
+#define VFD_clk 8 // This is the pin number 8 on Arduino UNO
+#define VFD_stb 9 // This is the pin number 9 on Arduino UNO
+#define VFD_latch 10 // This is the pin number 10 on Arduino UNO
+#define adjustPin    PIND // before is Port C, but I'm use port C to VFC Controle signals
+#define SegCntrlDDR   DDRD
+#define BIN(x) \
+    ( ((0x##x##L & 0x00000001L) ? 0x01 : 0) \
+    | ((0x##x##L & 0x00000010L) ? 0x02 : 0) \
+    | ((0x##x##L & 0x00000100L) ? 0x04 : 0) \
+    | ((0x##x##L & 0x00001000L) ? 0x08 : 0) \
+    | ((0x##x##L & 0x00010000L) ? 0x10 : 0) \
+    | ((0x##x##L & 0x00100000L) ? 0x20 : 0) \
+    | ((0x##x##L & 0x01000000L) ? 0x40 : 0) \
+    | ((0x##x##L & 0x10000000L) ? 0x80 : 0))
+
+
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned char second, minute, hour, dayOfWeek, dayOfMonth, month, year;
+
+unsigned char Digit;
+unsigned char number;
+unsigned char Grid;
+unsigned char counter = 0;
+unsigned long regist32 = 0b11111111;  //Hex value of 32 bits FF FF FF FF
+unsigned long lng32, lngTmp;
+
+unsigned long lngArray[10] = {0};
+
+short int displayMode = 5;
+short int configureMode = 0;
+int elapsedBtnTime = 0;
+
+unsigned char word1 = 0;
+unsigned char word2 = 0;
+unsigned char word3 = 0;
+unsigned char word4 = 0;
+unsigned long lng1 = 0;
+unsigned long lng2 = 0;
+unsigned long lng3 = 0;
+unsigned long lng4 = 0;
+
+// The lines bellow make the relation between the 32 registers and the pinout of SN75518
+// the line upper the zeros and ones is the letter or grid related to the bit position
+// for example: To bright the segment "a" look where is located letter upper table and
+// output bit from this position (pin number2) must be connected to the "a" of VFD.
+//
+// This binary is applied to the VFD and SN75518 on PCB board
+unsigned long segments[] = {
+  //font data tho numbers
+  //---------------------g-fe-dc-ba-  // the "." is dot and "_" is under number... the semicolon is not connected
+  0b00000000000000000000000110110110, //0
+  0b00000000000000000000000000010100, //1
+  0b00000000000000000000110010100110, //2
+  0b00000000000000000000110000110110, //3
+  0b00000000000000000000110100010100, //4
+  0b00000000000000000000110100110010, //5
+  0b00000000000000000000110110110010, //6
+  0b00000000000000000000000000010110, //7
+  0b00000000000000000000110110110110, //8
+  0b00000000000000000000110100110110, //9
+  0b00000000000000000100000000000000, //day of Week
+  0b00000000000000000000000000000000, //-
+  0b00000000000000000000010110010100, //H
+  0b00000000000000000000000110100010, //C
+  0b00000000000000000000010110000010  //F
+};
+unsigned long grids[] = {
+  //font data to grids
+  //FEDCBA9876543210---------------  //
+  0b00000000000000010000000000000000, //  Grid 0
+  0b00000000000000100000000000000000, //  Grid 1
+  0b00000000000001000000000000000000, //  Grid 2
+  0b00000000000010000000000000000000, //  Grid 3
+  0b00000000000100000000000000000000, //  Grid 4
+  0b00000000001000000000000000000000, //  Grid 5
+  0b00000000010000000000000000000000, //  Grid 6
+  0b00000000100000000000000000000000, //  Grid 7
+  0b00000001000000000000000000000000, //  Grid 8
+  0b00000010000000000000000000000000, //  Grid 9
+  0b00000100000000000000000000000000, //  Grid 10
+  0b00001000000000000000000000000000, //  Grid 11
+  0b00010000000000000000000000000000, //  Grid 12
+  0b00100000000000000000000000000000, //  Grid 13
+  0b01000000000000000000000000000000, //  Grid 14
+  0b10000000000000000000000000000000  //  Grid 15
+};
+// Is possible simplify the code removing the LongX, but, for now, stay to be more easy to catch the idea!
+//                      ----------------\//\-g.fe|dc|ba.  // the "." is dot and "_" is under number... the semicolon is not connected
+/******************* RTC *************************/
+void readRTCtime(unsigned char *second,
+                 unsigned char *minute,
+                 unsigned char *hour,
+                 unsigned char *dayOfWeek,
+                 unsigned char *dayOfMonth,
+                 unsigned char *month,
+                 unsigned char *year) {
+  //
+  // Read the a total of 7char format: SSMNHHDWDDMMYY from RTC module
+  Wire.beginTransmission(RTC_I2C_ADDRESS);
+  Wire.write(0); // set RTC register pointer to 00h
+  Wire.endTransmission();
+  Wire.requestFrom(RTC_I2C_ADDRESS, 7);  // send long of char to read,  note each char have 2 word of 4 bits
+  // request seven bytes of data from RTC starting from register 00h
+  // and keep it's on the pointers wich following(received on function)
+  *second = bcd2dec(Wire.read() & 0x7f);
+  *minute = bcd2dec(Wire.read());
+  *hour = bcd2dec(Wire.read() & 0x3f);
+  *dayOfWeek = bcd2dec(Wire.read());
+  *dayOfMonth = bcd2dec(Wire.read());
+  *month = bcd2dec(Wire.read());
+  *year = bcd2dec(Wire.read());
+}
+unsigned char dec2bcd(unsigned char val) {
+  return ( (val / 10 * 16) + (val % 10) );
+}
+/*************************************************/
+//
+/****** convertion of BCD to DEC *****************/
+
+// Convert binary coded decimal to normal decimal numbers
+unsigned char bcd2dec(unsigned char val) {
+  return ( (val / 16 * 10) + (val % 16) );
+}
+/*************************************************/
+/******* this function RUN one time on start up to set the module RTC ********/
+void setRTCtime(unsigned char second,
+                unsigned char minute,
+                unsigned char hour,
+                unsigned char dayOfWeek,
+                unsigned char dayOfMonth,
+                unsigned char month,
+                unsigned char year) {
+  //
+  // configure initial values on RTC(ss,mn,hh,dw,dd,mm,yy)
+  Wire.beginTransmission(RTC_I2C_ADDRESS);
+  Wire.write(0); // set next input to start at the secds register
+  Wire.write(dec2bcd(second)); // set secds
+  Wire.write(dec2bcd(minute)); // set minu
+  Wire.write(dec2bcd(hour)); // set hrs
+  Wire.write(dec2bcd(dayOfWeek)); // set day of week (1=Sunday, 7=Saturday)
+  Wire.write(dec2bcd(dayOfMonth)); // set date (1 to 31)
+  Wire.write(dec2bcd(month)); // set month
+  Wire.write(dec2bcd(year)); // set year (0 to 99)
+  Wire.endTransmission();
+}
+/************************************************************/
+void DisplayTime() {
+  // retrieve data from RTC
+  readRTCtime(&second, &minute, &hour, &dayOfWeek, &dayOfMonth, &month, &year);
+  if (displayMode == 5){ // Display hours/minutes/seconds + dayOfWeek
+    //Seconds
+    DigitTo7SegEncoder(second % 10);
+    lngArray[0]  = lng32 | grids[0];
+
+
+    DigitTo7SegEncoder(second / 10);
+    lngArray[1]  = lng32 | grids[1];
+    //*************************************************************
+
+    //Minutes
+    DigitTo7SegEncoder(minute % 10);
+    lngArray[2] = lng32 | grids[3];
+
+    DigitTo7SegEncoder(minute / 10);
+    lngArray[3]  = lng32 | grids[4];
+
+    //**************************************************************
+    //Hours
+    DigitTo7SegEncoder(hour % 10);
+    lngArray[4]  = lng32 | grids[6];
+
+    DigitTo7SegEncoder(hour / 10);
+    lngArray[5]  = lng32 | grids[7];
+
+    //Display Week Day
+    lngArray[8] = segments[10] | grids[9 - dayOfWeek]; //Sunday comes as 1 from RTC, position 10
+    lngTmp = lngArray[8];
+    SegTo32Bits();
+    delay(1);
+  }
+  if (displayMode == 6){    // display dayOfMonth/month/year + dayOfWeek
+    //year
+    DigitTo7SegEncoder(year % 10);
+    lngArray[0]  = lng32 | grids[0];
+
+    DigitTo7SegEncoder(year / 10);
+    lngArray[1]  = lng32 | grids[1];
+
+
+    //month
+    DigitTo7SegEncoder(month % 10);
+    lngArray[2] = lng32 | grids[3];
+
+    DigitTo7SegEncoder(month / 10);
+    lngArray[3]  = lng32 | grids[4];
+
+
+    //dayOfMonth
+    DigitTo7SegEncoder(dayOfMonth % 10);
+    lngArray[4]  = lng32 | grids[6];
+
+    DigitTo7SegEncoder(dayOfMonth / 10);
+    lngArray[5]  = lng32 | grids[7];
+
+    //Display Week Day
+    lngArray[8] = segments[10] | grids[9 - dayOfWeek]; //Sunday comes as 1 from RTC, position 10
+    lngTmp = lngArray[8];
+    SegTo32Bits();
+    delay(1);
+  }
+  for (int k = 5; k >= 0; k--){
+    lngTmp = lngArray[k];
+    SegTo32Bits();
+    delay(1);
+  }
+}
+/****************************END RTC ************************/
+/***DHT***/
+void DisplayDHT(short int mode){
+  //mode 0 = humidity
+  //mode 1 = temperature (Cº)
+  //mode 2 = temperature (F)
+  //mode 3 = Heat index (Cº)
+  //mode 4 = Heat index (F)
+
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+  float h = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  float t = dht.readTemperature();
+  // Read temperature as Fahrenheit (isFahrenheit = true)
+  float f = dht.readTemperature(true);
+
+  // Check if any reads failed and exit early (to try again).
+  if (isnan(h) || isnan(t) || isnan(f)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    return;
+  }
+
+  // Compute heat index in Fahrenheit (the default)
+  float hif = dht.computeHeatIndex(f, h);
+  // Compute heat index in Celsius (isFahreheit = false)
+  float hic = dht.computeHeatIndex(t, h, false);
+
+  /*Serial.print(F("Humidity: "));   
+    Serial.print(h);
+    Serial.print(F("%  Temperature: "));
+    Serial.print(t);
+    Serial.print(F("°C "));
+    Serial.print(f);
+    Serial.print(F("°F  Heat index: "));
+    Serial.print(hic);
+    Serial.print(F("°C "));
+    Serial.print(hif);
+    Serial.println(F("°F"));
+  */
+  DHTTOVFD(mode, h, t, f, hic, hif);
+}
+void DHTTOVFD(short int mode, float h, float t, float f, float hic, float hif){
+  unsigned long dhtLngArray[5];
+  
+  if (mode == 0)
+    AlphaTo7SegEncoder('H');
+  if (mode == 1 || mode == 3)
+    AlphaTo7SegEncoder('C');
+  if (mode == 2 || mode == 4)
+    AlphaTo7SegEncoder('F');
+
+  dhtLngArray[0] = lng32 | grids[0]; //show units
+  lngTmp = dhtLngArray[0];
+  SegTo32Bits();
+  delay(1);
+
+  float temp;
+
+ switch (mode)
+  {
+    case 0:  AlphaTo7SegEncoder('H');
+      temp = h;
+      break;
+    case 1:  AlphaTo7SegEncoder('C');
+      temp = t;
+      break;
+    case 2:  AlphaTo7SegEncoder('F');
+      temp = f;
+      break;
+    case 3:  AlphaTo7SegEncoder('C');
+      temp = hic;
+      break;
+    case 4:  AlphaTo7SegEncoder('F');
+      temp = hif;
+      break;
+  }
+  int tempToInt = temp;
+
+  DigitTo7SegEncoder(temp / 10);
+  dhtLngArray[2] = lng32 | grids[7];
+  lngTmp = dhtLngArray[2];
+  SegTo32Bits();
+  delay(1);
+
+  DigitTo7SegEncoder(tempToInt % 10);
+  dhtLngArray[1] = lng32 | grids[6];
+  lngTmp = dhtLngArray[1];
+  SegTo32Bits();
+  delay(1);
+
+  temp -= tempToInt;
+  temp *= 100;
+  tempToInt = temp; // get decimals from Humidity
+
+  DigitTo7SegEncoder(tempToInt / 10);
+  dhtLngArray[3] = lng32 | grids[4];
+  lngTmp = dhtLngArray[3];
+  SegTo32Bits();
+  delay(1);
+
+  DigitTo7SegEncoder(tempToInt % 10);
+  dhtLngArray[4] = lng32 | grids[3];
+  lngTmp = dhtLngArray[4];
+  SegTo32Bits();
+  delay(1);
+}
+/***DHT***/
+void DigitTo7SegEncoder( unsigned char digit) {
+  lng32 = segments[digit];
+}
+void AlphaTo7SegEncoder(unsigned char alpha){
+  switch (alpha)
+  {
+    case 'H':
+    case 'h': lng32 = segments[12];
+      break;
+    case 'C':
+    case 'c':
+      lng32 = segments[13];
+      break;
+    case 'F':
+    case 'f':
+      lng32 = segments[14];
+      break;
+  }
+}
+void SegTo32Bits() {
+  word4 = (lngTmp & 0xff000000UL) >> 24;
+  word3 = (lngTmp & 0x00ff0000UL) >> 16;
+  word2 = (lngTmp & 0x0000ff00UL) >>  8;
+  word1 = (lngTmp & 0x000000ffUL) >>  0;  // This can be suppressed because only need 10 + 9 bits on VFD
+
+  send_revChar(word4);  // This can be suppressed because only need 10 + 9 bits on VFD
+  send_revChar(word3);
+  send_revChar(word2);
+  send_revChar(word1);
+
+  digitalWrite(VFD_latch, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(VFD_latch, LOW);
+  delayMicroseconds(2);
+}
+void send_char(unsigned char a) {
+  //this code is to SN75518
+  unsigned char data = 170; //value to transmit, binary 10101010
+  unsigned char mask = 1; //our bitmask
+  data = a;
+  digitalWrite(VFD_clk, HIGH);
+  delayMicroseconds(2);
+  for (mask = 00000001; mask > 0; mask <<= 1) { //iterate through bit mask
+    digitalWrite(VFD_clk, LOW);
+    delayMicroseconds(2);
+    if (data & mask) { // if bitwise AND resolves to true
+      digitalWrite(VFD_in, HIGH);
+    }
+    else { //if bitwise and resolves to false
+      digitalWrite(VFD_in, LOW);
+    }
+    delayMicroseconds(2);
+    digitalWrite(VFD_clk, HIGH);
+    delayMicroseconds(2);
+  }
+}
+void send_revChar(unsigned char a) {
+  //this code is to SN75518
+  unsigned char data = 170; //value to transmit, binary 10101010
+  unsigned char mask = 0b10000000; //our bitmask
+  data = a;
+  digitalWrite(VFD_clk, HIGH);
+  delayMicroseconds(2);
+  for (mask = 10000000; mask > 0; mask >>= 1) { //iterate through bit mask
+    digitalWrite(VFD_clk, LOW);
+    delayMicroseconds(2);
+    if (data & mask) { // if bitwise AND resolves to true
+      digitalWrite(VFD_in, HIGH);
+    }
+    else { //if bitwise and resolves to false
+      digitalWrite(VFD_in, LOW);
+    }
+    delayMicroseconds(2);
+    digitalWrite(VFD_clk, HIGH);
+    delayMicroseconds(2);
+  }
+}
+//*************************************************//
+//*******Test Functions***************//
+void RunGrid(){
+  int j = 0;
+  int i = 0;
+  while (true)
+  {
+    delayMicroseconds(2);
+
+    lngTmp = segments[i] | grids[j];
+    SegTo32Bits();
+    if (j >= 10)
+    {
+      j = 0;
+      i++;
+    }
+    else
+      j++;
+    if (i > 15)
+      i = 0;
+
+    delay(100);
+    Serial.println(j);
+  }
+}
+void ChangeMode(){      //change display Information by pressing btnMode
+  if (elapsedBtnTime > 10)
+    if (!digitalRead(btnMode) && configureMode == 0){
+      if (displayMode < 6)
+        displayMode++;
+      else
+        displayMode = 0;
+        //Serial.println((String)"Display Mode: " + displayMode);
+      elapsedBtnTime = 0;
+    }
+}
+void SetConfigRTC(){    //Enter configuration Mode
+  if (elapsedBtnTime > 10)
+  {
+    if ((displayMode == 5  || displayMode == 6) && !digitalRead(btnSet)){    // if mode = time && btnSec is pressed, configure RTC
+      if (configureMode < 4)
+        configureMode++;
+      else
+        configureMode = 1;
+        elapsedBtnTime = 0;
+    }
+    if (configureMode != 0 && !digitalRead(btnMode)){     // if btnMode pressed while in configureMode, get out of configureMode
+      configureMode = 0;
+      elapsedBtnTime = 0;
+    }
+  }
+  if (configureMode != 0){
+    lngArray[9] = segments[configureMode] + 1 | grids[9];     // light VFD position to get feedbak of which config Mode we are
+    lngTmp = lngArray[9];
+    SegTo32Bits();
+    delay(1);
+  }
+}
+void ConfigRTC(){         // Configure RTC through display and buttons
+  if (configureMode != 0){
+    if (elapsedBtnTime > 10){
+
+      if (displayMode == 5){
+        if (!digitalRead(btnUp)){
+          switch (configureMode){
+            case 1: if (hour < 23)
+                hour++;
+              else
+                hour = 0;
+              break;
+            case 2: if (minute < 59) minute++; else minute = 0;
+              break;
+            case 3: if (second < 59) second++; else second = 0;
+              break;
+            case 4: if (dayOfWeek < 7) dayOfWeek++; else dayOfWeek = 1;
+              break;
+          }
+          setRTCtime(second, minute, hour, dayOfWeek, dayOfMonth, month, year);
+          elapsedBtnTime = 0;
+        }
+
+        if (!digitalRead(btnDown)){
+          switch (configureMode){
+            case 1: if (hour > 0) hour--; else hour = 23;
+              break;
+            case 2: if (minute > 0) minute--; else minute = 59;
+              break;
+            case 3: if (second > 0) second--; else second = 59;
+              break;
+            case 4: if (dayOfWeek > 1) dayOfWeek--; else dayOfWeek = 7;
+              break;
+          }
+          setRTCtime(second, minute, hour, dayOfWeek, dayOfMonth, month, year);
+          elapsedBtnTime = 0;
+        }
+      }
+
+      if (displayMode == 6){
+        if (!digitalRead(btnUp)){
+          switch (configureMode){
+            case 1:  if (dayOfWeek < 7) dayOfWeek++; else dayOfWeek = 1;
+              break;
+            case 2: if (dayOfMonth < 31) dayOfMonth++; else dayOfMonth = 1;
+              break;
+            case 3: if (month < 12) month++; else month = 1;
+              break;
+            case 4: if (year < 99) year++; else year = 0;
+              break;
+          }
+          setRTCtime(second, minute, hour, dayOfWeek, dayOfMonth, month, year);
+          elapsedBtnTime = 0;
+        }
+
+        if (!digitalRead(btnDown)){
+          switch (configureMode){
+            case 1: if (dayOfWeek > 1) dayOfWeek--; else dayOfWeek = 7;
+              break;
+            case 2: if (dayOfMonth > 1) dayOfMonth--; else dayOfMonth = 31;
+              break;
+            case 3: if (month > 1) month--; else month = 12;
+              break;
+            case 4: if (year > 0) year--; else year = 99;
+              break;
+          }
+          setRTCtime(second, minute, hour, dayOfWeek, dayOfMonth, month, year);
+          elapsedBtnTime = 0;
+        }
+      }
+    }
+  }
+}
+void setup() {
+  pinMode(VFD_clk, OUTPUT);
+  pinMode(VFD_in, OUTPUT);
+  pinMode(VFD_stb, OUTPUT);
+  pinMode(VFD_latch, OUTPUT);
+  pinMode(btnMode, INPUT_PULLUP); // Pin 3
+  pinMode(btnUp, INPUT_PULLUP); // Pin 4
+  pinMode(btnDown, INPUT_PULLUP); // Pin 5
+  pinMode(btnSet, INPUT_PULLUP); // Pin 6
+
+  pinMode(13, OUTPUT);
+
+  digitalWrite(VFD_stb, LOW);
+  Serial.begin(9600);
+  Wire.begin();
+}
+void loop() {
+  //RunGrid();
+  elapsedBtnTime++;
+  digitalWrite(VFD_stb, LOW);
+  delayMicroseconds(2);
+
+  ChangeMode();
+  SetConfigRTC();
+  ConfigRTC();
+
+  if (displayMode <= 4)
+  {
+    DisplayDHT(displayMode);
+  } else
+  DisplayTime();
+  digitalWrite(VFD_stb, HIGH);
+  delay(10);
+}
